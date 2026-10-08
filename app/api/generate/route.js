@@ -3,6 +3,7 @@ import { createRemoteJWKSet, jwtVerify } from "jose";
 
 const allowedMarketplaces = new Set(["Amazon", "Shopify", "eBay"]);
 const allowedTones = new Set(["Professional", "Persuasive", "SEO-focused"]);
+const geminiModel = process.env.GEMINI_MODEL || "gemini-3.8-flash";
 const firebaseSigningKeys = createRemoteJWKSet(
   new URL("https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com"),
 );
@@ -139,37 +140,83 @@ ${rawDescription}
 Return only a JSON object with exactly these fields: "seoTitle" (string, concise and searchable), "bulletPoints" (array of 5 concise strings), "descriptionHtml" (a safe, simple HTML description using paragraphs and optionally a short unordered list; no scripts or inline styles), and "backendKeywords" (array of 10 concise search phrases).`;
 
   let response;
-  try {
-    response = await fetch(
-      "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-goog-api-key": apiKey,
-        },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: {
-            responseMimeType: "application/json",
-            temperature: 0.7,
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-goog-api-key": apiKey,
           },
-        }),
-        signal: AbortSignal.timeout(30000),
-      },
-    );
-  } catch {
-    return NextResponse.json(
-      { error: "Could not reach Gemini. Check your connection and try again." },
-      { status: 502 },
-    );
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: {
+              responseMimeType: "application/json",
+              temperature: 0.7,
+            },
+          }),
+          signal: AbortSignal.timeout(45000),
+        },
+      );
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "Unknown network error";
+      console.error("Gemini request failed before receiving a response.", {
+        model: geminiModel,
+        attempt: attempt + 1,
+        reason,
+      });
+      if (attempt === 0) {
+        await new Promise((resolve) => setTimeout(resolve, 700));
+        continue;
+      }
+      return NextResponse.json(
+        { error: `Could not reach Gemini: ${reason}` },
+        { status: 502 },
+      );
+    }
+
+    if (![500, 502, 503, 504].includes(response.status) || attempt === 1) break;
+    await response.body?.cancel();
+    await new Promise((resolve) => setTimeout(resolve, 700));
   }
 
   if (!response.ok) {
-    const status = response.status === 429 ? 429 : 502;
+    let apiMessage = "";
+    try {
+      const payload = await response.json();
+      apiMessage = payload.error?.message || "";
+    } catch {
+      apiMessage = "";
+    }
+
+    const safeMessage = (apiMessage || response.statusText || "No error details were provided by Google.")
+      .replaceAll(apiKey, "[redacted]")
+      .replace(/[\r\n\t]+/g, " ")
+      .slice(0, 400);
+    console.error("Gemini rejected listing generation.", {
+      model: geminiModel,
+      status: response.status,
+      message: safeMessage,
+    });
+
+    let error = `Gemini returned HTTP ${response.status}: ${safeMessage}`;
+    if (response.status === 401 || response.status === 403) {
+      error = `Gemini rejected the API key or its permissions (HTTP ${response.status}): ${safeMessage}`;
+    } else if (
+      response.status === 404 ||
+      (apiMessage.toLowerCase().includes("model") && apiMessage.toLowerCase().includes("not available"))
+    ) {
+      error = `The Gemini model "${geminiModel}" is unavailable for this API key. Set GEMINI_MODEL to a model enabled for your key and restart the server.`;
+    } else if (response.status === 429) {
+      error = `Gemini rate limit or quota (HTTP 429): ${safeMessage}`;
+    } else if (response.status >= 500) {
+      error = `Gemini service error (HTTP ${response.status}): ${safeMessage}`;
+    }
     return NextResponse.json(
-      { error: response.status === 429 ? "Gemini is busy. Please try again shortly." : "Gemini could not generate this listing. Check your API key and try again." },
-      { status },
+      { error },
+      { status: response.status === 429 ? 429 : 502 },
     );
   }
 
