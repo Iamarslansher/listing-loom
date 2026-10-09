@@ -14,9 +14,9 @@ The Firebase web configuration is intended to be public; restrict its API key to
 
 ## Configuration
 
-`NEXT_PUBLIC_FIREBASE_API_KEY`, `NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN`, `NEXT_PUBLIC_FIREBASE_PROJECT_ID`, and `NEXT_PUBLIC_FIREBASE_APP_ID` are required for Firebase. The storage bucket and messaging sender ID can also be configured. `GEMINI_API_KEY` is required to generate listing copy. `GEMINI_MODEL` optionally selects an enabled Gemini model and defaults to `gemini-3.8-flash`. Missing configuration is shown in the app rather than hidden behind a demo response.
+`NEXT_PUBLIC_FIREBASE_API_KEY`, `NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN`, `NEXT_PUBLIC_FIREBASE_PROJECT_ID`, and `NEXT_PUBLIC_FIREBASE_APP_ID` are required for Firebase. The storage bucket and messaging sender ID can also be configured. `GEMINI_API_KEY` is required to generate listing copy. `GEMINI_MODEL` optionally selects an enabled Gemini model and defaults to `gemini-2.5-flash`. Missing configuration is shown in the app rather than hidden behind a demo response.
 
-If Gemini generation fails, the app displays Google's HTTP status and sanitized error detail. HTTP 429 indicates a rate limit or quota issue; HTTP 5xx means Gemini failed to serve the request, and the app retries those transient responses once. Check Google AI Studio API-key access and quota, and restart the development server after changing `.env.local`.
+Gemini generation retries transient network and HTTP errors with exponential backoff, honors `Retry-After`, and tries `gemini-2.5-flash-lite` if the selected model continues returning HTTP 5xx errors. HTTP 429 indicates a rate limit or quota issue and is reported without switching models. If both models are unavailable, the app displays Google's HTTP status and sanitized error detail. Check Google AI Studio API-key access and quota, and restart the development server after changing `.env.local`.
 
 ### Firebase says “API key not valid”
 

@@ -2,13 +2,16 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { onAuthStateChanged } from "firebase/auth";
 import { doc, getDoc, serverTimestamp, setDoc } from "firebase/firestore";
 import { ArrowRight, Chrome } from "lucide-react";
+import { toast } from "sonner";
 import { Brand } from "../../components/Brand";
 import { getFirebaseConfigError, getFirebaseServices } from "../../lib/firebase";
 
 export default function LoginPage() {
+  const router = useRouter();
   const [mode, setMode] = useState("signup");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -21,15 +24,16 @@ export default function LoginPage() {
       setServices(getFirebaseServices());
     } catch (serviceError) {
       setError(serviceError.message);
+      toast.error(serviceError.message);
       return;
     }
     const { auth } = getFirebaseServices();
     let initialAuthCheck = true;
     return onAuthStateChanged(auth, (user) => {
-      if (initialAuthCheck && user) window.location.assign("/dashboard");
+      if (initialAuthCheck && user) router.replace("/dashboard");
       initialAuthCheck = false;
     });
-  }, []);
+  }, [router]);
 
   async function handleAuth(action) {
     setError("");
@@ -62,7 +66,14 @@ export default function LoginPage() {
       } else {
         await setDoc(userRef, { ...userData, createdAt: serverTimestamp() });
       }
-      window.location.assign("/dashboard");
+      toast.success(
+        action === "google"
+          ? "Signed in successfully."
+          : mode === "signup"
+            ? "Account created successfully."
+            : "Welcome back.",
+      );
+      router.push("/dashboard");
     } catch (authError) {
       const messages = {
         "auth/email-already-in-use": "An account already exists for this email. Try logging in.",
@@ -78,11 +89,11 @@ export default function LoginPage() {
         code.includes("invalid-api-key") ||
         message.toLowerCase().includes("api key not valid");
 
-      setError(
-        invalidApiKey
+      const errorMessage = invalidApiKey
           ? "Firebase rejected this project's Web API key. In Firebase Console → Project settings → General, copy the Web app config's apiKey into NEXT_PUBLIC_FIREBASE_API_KEY in .env.local. In Google Cloud Console, make sure the key allows the Identity Toolkit API and your current domain. Restart the dev server after changing it."
-          : messages[code] || message || "Sign-in failed. Please try again.",
-      );
+          : messages[code] || message || "Sign-in failed. Please try again.";
+      setError(errorMessage);
+      toast.error(errorMessage);
     } finally {
       setBusy(false);
     }

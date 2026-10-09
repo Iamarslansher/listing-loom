@@ -1,11 +1,21 @@
 import { NextResponse } from "next/server";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 
-const allowedMarketplaces = new Set(["Amazon", "Shopify", "eBay"]);
+const allowedMarketplaces = new Set([
+  "Amazon",
+  "Shopify",
+  "eBay",
+  "Daraz",
+  "Alibaba",
+  "Temu",
+  "Etsy",
+  "AliExpress",
+]);
 const allowedTones = new Set(["Professional", "Persuasive", "SEO-focused"]);
 
-// Updated fallback model to gemini-2.5-flash
 const geminiModel = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const fallbackGeminiModel = "gemini-2.5-flash-lite";
+const retryableStatuses = new Set([408, 429, 500, 502, 503, 504]);
 
 const firebaseSigningKeys = createRemoteJWKSet(
   new URL(
@@ -106,6 +116,58 @@ function sanitizeDescription(html) {
   );
 }
 
+async function requestGemini(prompt, apiKey, model, maxAttempts = 3) {
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    let response;
+    try {
+      response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-goog-api-key": apiKey,
+          },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: {
+              responseMimeType: "application/json",
+              temperature: 0.7,
+            },
+          }),
+          signal: AbortSignal.timeout(45000),
+        },
+      );
+    } catch (error) {
+      const reason =
+        error instanceof Error ? error.message : "Unknown network error";
+      console.error("Gemini request failed before receiving a response.", {
+        model,
+        attempt: attempt + 1,
+        reason,
+      });
+      if (attempt === maxAttempts - 1) return { response: null, networkError: reason };
+      await new Promise((resolve) =>
+        setTimeout(resolve, Math.min(1000 * 2 ** attempt, 8000) + Math.random() * 250),
+      );
+      continue;
+    }
+
+    if (!retryableStatuses.has(response.status) || attempt === maxAttempts - 1) {
+      return { response, networkError: "" };
+    }
+
+    const retryAfter = Number(response.headers.get("retry-after"));
+    await response.body?.cancel();
+    const delay = Number.isFinite(retryAfter) && retryAfter > 0
+      ? Math.min(retryAfter * 1000, 15000)
+      : Math.min(1000 * 2 ** attempt, 8000) + Math.random() * 250;
+    await new Promise((resolve) => setTimeout(resolve, delay));
+  }
+
+  return { response: null, networkError: "Gemini request attempts were exhausted." };
+}
+
 export async function POST(request) {
   const auth = await verifyFirebaseToken(request);
   if (auth.error === "missing-project") {
@@ -189,62 +251,31 @@ ${rawDescription}
 
 Return only a JSON object with exactly these fields: "seoTitle" (string, concise and searchable), "bulletPoints" (array of 5 concise strings), "descriptionHtml" (a safe, simple HTML description using paragraphs and optionally a short unordered list; no scripts or inline styles), and "backendKeywords" (array of 10 concise search phrases).`;
 
-  let response;
-  const maxAttempts = 3;
-
-  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-    try {
-      response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "x-goog-api-key": apiKey,
-          },
-          body: JSON.stringify({
-            contents: [{ parts: [{ text: prompt }] }],
-            generationConfig: {
-              responseMimeType: "application/json",
-              temperature: 0.7,
-            },
-          }),
-          signal: AbortSignal.timeout(45000),
-        },
-      );
-    } catch (error) {
-      const reason =
-        error instanceof Error ? error.message : "Unknown network error";
-      console.error("Gemini request failed before receiving a response.", {
-        model: geminiModel,
-        attempt: attempt + 1,
-        reason,
-      });
-
-      if (attempt < maxAttempts - 1) {
-        // Wait 1.5s on first network error, 3s on second
-        await new Promise((resolve) =>
-          setTimeout(resolve, (attempt + 1) * 1500),
-        );
-        continue;
-      }
-      return NextResponse.json(
-        { error: `Could not reach Gemini: ${reason}` },
-        { status: 502 },
-      );
-    }
-
-    // Retry on HTTP 500, 502, 503 (Overloaded), 504
-    if (
-      ![500, 502, 503, 504].includes(response.status) ||
-      attempt === maxAttempts - 1
-    )
-      break;
-
-    await response.body?.cancel();
-    // Exponential backoff: 2s delay after attempt 1, 4s delay after attempt 2
-    await new Promise((resolve) => setTimeout(resolve, (attempt + 1) * 2000));
+  let activeModel = geminiModel;
+  let result = await requestGemini(prompt, apiKey, activeModel);
+  if (
+    result.response &&
+    result.response.status >= 500 &&
+    result.response.status <= 599 &&
+    activeModel !== fallbackGeminiModel
+  ) {
+    console.warn("Primary Gemini model remains unavailable; trying fallback.", {
+      model: activeModel,
+      fallbackModel: fallbackGeminiModel,
+      status: result.response.status,
+    });
+    await result.response.body?.cancel();
+    activeModel = fallbackGeminiModel;
+    result = await requestGemini(prompt, apiKey, activeModel, 2);
   }
+
+  if (!result.response) {
+    return NextResponse.json(
+      { error: `Could not reach Gemini: ${result.networkError}` },
+      { status: 502 },
+    );
+  }
+  const { response } = result;
 
   if (!response.ok) {
     let apiMessage = "";
@@ -265,7 +296,7 @@ Return only a JSON object with exactly these fields: "seoTitle" (string, concise
       .slice(0, 400);
 
     console.error("Gemini rejected listing generation.", {
-      model: geminiModel,
+      model: activeModel,
       status: response.status,
       message: safeMessage,
     });
@@ -278,16 +309,26 @@ Return only a JSON object with exactly these fields: "seoTitle" (string, concise
       (apiMessage.toLowerCase().includes("model") &&
         apiMessage.toLowerCase().includes("not available"))
     ) {
-      error = `The Gemini model "${geminiModel}" is unavailable for this API key. Set GEMINI_MODEL to a model enabled for your key in .env.local and restart the server.`;
+      error = `The Gemini model "${activeModel}" is unavailable for this API key. Set GEMINI_MODEL to a model enabled for your key in .env.local and restart the server.`;
     } else if (response.status === 429) {
       error = `Gemini rate limit or quota (HTTP 429): ${safeMessage}`;
+    } else if (response.status === 503) {
+      error =
+        activeModel === geminiModel
+          ? `Gemini is temporarily overloaded (HTTP 503): ${safeMessage}`
+          : `Gemini is temporarily overloaded. The selected model and fallback were unavailable (HTTP 503): ${safeMessage}`;
     } else if (response.status >= 500) {
       error = `Gemini service error (HTTP ${response.status}): ${safeMessage}`;
     }
 
     return NextResponse.json(
       { error },
-      { status: response.status === 429 ? 429 : 502 },
+      {
+        status:
+          response.status === 429 || response.status >= 500
+            ? response.status
+            : 502,
+      },
     );
   }
 
